@@ -1,0 +1,367 @@
+# Translation Product — Technical Architecture & Implementation Brief
+
+**Working Design v0.4 | For Mpongo (Programmer / Technical Lead)**
+
+**Status:** Proposed implementation of the user-directed architecture.
+
+## 1. Architecture Overview
+
+We intend to rebuild the translation workflow to produce high-quality, context-aware English-to-Arabic translations.
+
+Instead of translating isolated PowerPoint elements and comparing outputs from ChatGPT and DeepL, the system will:
+
+1. Understand the full document, including its purpose, subject, arguments and terminology.
+2. Translate related content together, using document context and relevant knowledge.
+3. Review translation accuracy and professional Arabic writing quality.
+4. Correct identified issues, verify corrections and audit the complete translation.
+5. Allow the administrator to inspect the process and modify prompts, templates and translation knowledge.
+
+**How the system works technically:** The existing website and application backend will coordinate a sequence of model calls, each using a defined prompt, structured input and expected output. The reasoning, translation and review functions may use different locally hosted models, or share the same model where appropriate.
+
+The application manages the sequence, passes results between stages and saves diagnostics. The models handle linguistic interpretation, decisions, translation and review.
+
+The existing PowerPoint extraction and reconstruction functionality is **assumed available** and will be reused.
+
+---
+
+## 2. Translation Workflow
+
+The following sequence describes what the application should execute when a customer uploads a document.
+
+### 2.1 Processing Sequence
+
+**1. Extract the document**
+
+- **Executed by:** Existing PowerPoint processing functionality.
+- Extract all supported English text and its PowerPoint location, assigning a unique ID to every text element.
+- **Output:** Structured source content containing text, IDs, slides and original object locations.
+
+**2. Understand the document**
+
+- **Executed by:** Reasoning model using `01_document_context.md`.
+- Analyze the entire document, supported by relevant glossary entries and reference knowledge.
+- Identify its content, concrete purpose, audience, domain, structure, abbreviations, terminology and unresolved ambiguities.
+- **Output:** `context_profile.json`, following the document-context template.
+
+**3. Validate context with the customer**
+
+- **Executed by:** Website, using the reasoning model's outputs.
+- Present the inferred purpose and audience for confirmation or editing.
+- Show identified abbreviations and terms, with suggested meanings and Arabic equivalents, allowing the customer to confirm, correct or add terms.
+- Present other unresolved ambiguities as open-ended questions.
+- Allow the customer to skip; skipped information remains unconfirmed.
+- **Output:** Updated context profile with customer inputs and validation statuses.
+
+**4. Determine translation batches**
+
+- **Executed by:** Reasoning model using `02_batch_plan.md`.
+- Determine which related English content should be translated together, considering document structure and the context available to the translation model.
+- Rather than translating isolated text elements, the reasoner determines the appropriate chunks of text and supporting context to send together to the translator.
+- **Output:** `batch_plan.json`, containing ordered translation batches, their segment IDs and the contextual material required.
+
+**5. Translate the document**
+
+- **Executed by:** Translation model using `03_translate.md`.
+- Translate each planned batch using the document context, approved glossary, relevant bilingual examples and translation/style guidance.
+- Return Arabic associated with each source text ID.
+- **Output:** `translations.json`, containing the initial Arabic translation.
+
+**6. Review translation quality**
+
+- **Executed by:** Bilingual review model using `04_bilingual_review.md`.
+- Compare English and Arabic for factual and semantic accuracy, completeness, terminology, argument, certainty and professional Arabic writing.
+- Record each issue against its affected text ID.
+- **Output:** `review_findings.json`, including issues, severity, explanations and suggested corrections.
+
+**7. Decide, correct and verify**
+
+- **Executed by:** Reasoning model using `05_correction_decision.md`, followed by the translation model using `06_targeted_revision.md`.
+- The reasoner determines whether each finding should be corrected, retained or flagged for human attention.
+- The translator corrects only the relevant text IDs.
+- The reviewer checks the revised text again using `04_bilingual_review.md`.
+- Repeat only within the configured maximum revision cycles.
+- **Output:** Correction decisions, revised Arabic, verification findings and translation history.
+
+**8. Audit the complete translation**
+
+- **Executed by:** Reasoning/review model using `07_document_audit.md`.
+- Examine the English and Arabic documents together to identify document-wide issues, including missing content, inconsistent terms, contradictions, abbreviations and cross-slide coherence.
+- For identified issues, use `08_audit_correction_decision.md` to decide the action and `09_audit_targeted_revision.md` to correct affected content.
+- Verify corrections through the audit process, within the configured limits.
+- **Output:** `audit_findings.json`, final corrections and audit outcomes.
+
+**9. Reconstruct and deliver**
+
+- **Executed by:** Existing PowerPoint processing functionality and application.
+- Insert final Arabic into the corresponding PowerPoint objects using their IDs.
+- Store the translated PPTX, processing outputs and diagnostics.
+- **Output:** Final Arabic PowerPoint available for customer download.
+
+### 2.2 Important Implementation Principle: Tracking IDs
+
+Every extracted text element must retain its unique ID throughout translation, review, revision and auditing.
+
+For example:
+
+| Text ID | English source | Initial Arabic | Final Arabic | Review count |
+|---|---|---|---|---|
+| S03-T05 | Further measures may be required | يجب اتخاذ تدابير إضافية | قد تكون هناك حاجة إلى تدابير إضافية | 2 |
+
+When a reviewer finds an error, the finding refers to `S03-T05`. When the reasoner makes a decision or the translator corrects the text, the same ID is used.
+
+This allows the application to track:
+
+- How many times a text element was reviewed or revised.
+- Every version of its Arabic translation.
+- What issues were identified, and how they were resolved.
+- Which translation belongs to which original PowerPoint object.
+
+A finding can reference multiple IDs when an issue spans several text elements.
+
+The application must preserve these relationships rather than relying on models to remember or recreate IDs.
+
+---
+
+## 3. Proposed System Files, Prompts and Templates
+
+The following structure is illustrative. Mpongo can implement it using files, database records or an equivalent approach.
+
+### 3.1 Model Prompts
+
+Each prompt provides the instructions for a specific model task. The application calls the relevant model, supplies the prompt and required information, and receives the expected structured output.
+
+| Proposed file | Purpose and how it is used |
+|---|---|
+| `01_document_context.md` | Instructs the reasoning model to analyze all extracted content, establish document context, identify and interpret terms/abbreviations using relevant knowledge, and generate questions for customer validation |
+| `02_batch_plan.md` | Instructs the reasoning model to decide **which portions of the document should be sent together to the translator**, including which neighboring or section context to provide. This avoids translating sentence by sentence without adequate context or repeatedly sending the entire document unnecessarily. It also includes guidance for choosing safe smaller batches when needed |
+| `03_translate.md` | Instructs the translation model to translate each batch faithfully and naturally, using the document profile, approved terminology, examples and translation guidance |
+| `04_bilingual_review.md` | Instructs the reviewer to assess both English-source fidelity and professional Arabic quality, identify issues and return structured findings linked to text IDs |
+| `05_correction_decision.md` | Instructs the reasoner to assess reviewer findings and choose `fix`, `keep` or `needs_human`, with a short explanation |
+| `06_targeted_revision.md` | Instructs the translator to revise only the affected translations, using their English source, current Arabic, issues and context |
+| `07_document_audit.md` | Instructs the model to examine the complete document for consistency, completeness and document-wide quality issues |
+| `08_audit_correction_decision.md` | Instructs the reasoner to assess audit findings and decide which issues require correction, retention or human attention |
+| `09_audit_targeted_revision.md` | Instructs the translator to correct document-wide issues identified by the audit, taking the surrounding sections and consistency requirements into account |
+
+The separate audit correction prompts are proposed to allow document-wide problems to be treated differently from individual translation errors. They may reuse the same underlying model and correction mechanism.
+
+### 3.2 Knowledge and Reference Resources
+
+These are the materials supplied to relevant stages of the workflow. They should be manageable through Admin rather than hard-coded.
+
+| Resource | What it contains | Main use |
+|---|---|---|
+| `general_translation_guidance.md` | Translation principles covering accuracy, meaning, argument, emphasis and source fidelity | Translation and quality review |
+| `arabic_style_guide.md` | Guidance on natural Arabic, brevity, pronouns, idioms, professional register and writing conventions | Translation and quality review |
+| Approved glossary | English terms, abbreviations, definitions and approved Arabic equivalents | Document interpretation, customer validation, translation and review |
+| Validated bilingual examples | Professionally approved English source passages and their Arabic translations, with supporting context | Provide relevant translation and writing examples |
+| Reference documents | Approved institutional, sector, client or project documents | Help interpret terminology, contextual references and subject matter |
+
+#### A. Approved Glossary — Proposed Structure
+
+The glossary should be manageable as an editable Admin table, with CSV import/export.
+
+| Field | Description / example |
+|---|---|
+| English term / abbreviation | `FSDP` |
+| Full English meaning | Financial Sector Development Program |
+| Arabic equivalent | برنامج تطوير القطاع المالي |
+| Subsequent-use form | البرنامج, when context is clear |
+| Definition / context | Saudi financial-sector development program |
+| Domain | Finance / Government |
+| Scope | Global, domain, client or project |
+| Status | Approved / Draft |
+
+The reasoner can identify additional terminology during document interpretation, but suggestions must remain separate from approved glossary entries until validated.
+
+#### B. Validated Bilingual Examples — Proposed Structure
+
+Each reference should contain:
+
+| Field | Description |
+|---|---|
+| Example ID | Unique identifier |
+| English source | Original English passage |
+| Approved Arabic | Validated professional Arabic translation |
+| Context | Surrounding meaning and intended use |
+| Domain / document type | E.g. financial strategy, government report |
+| Scope | Global, domain, client or project |
+| Source / provenance | Where the reference originated |
+| Approval status | Draft / Approved |
+
+A structured table, JSONL file or database can hold these records.
+
+The application should retrieve examples relevant to the document or passage, rather than automatically sending every example with every model call.
+
+### 3.3 Structured Output Templates
+
+**Purpose:** Define what information each model should return so the next processing stage can use it, and so the results can be inspected through Admin.
+
+These are proposed logical JSON outputs, not necessarily separate physical files.
+
+| Template / output | Required information |
+|---|---|
+| `source_segments.json` | Text ID, English source, slide number, original PowerPoint object location and reading order |
+| `context_profile.json` | Document summary, purpose, audience, domain, structure, abbreviation/term interpretations, open questions and validation statuses |
+| `batch_plan.json` | Ordered batch IDs, text IDs included in each batch and context to be supplied |
+| `translations.json` | Text ID, Arabic translation and translation version |
+| `review_findings.json` | Finding ID, affected text IDs, issue category, severity, explanation and suggested correction |
+| `correction_decisions.json` | Finding ID, decision (`fix`, `keep`, `needs_human`) and explanation |
+| `audit_findings.json` | Document-level issues, affected text IDs, explanations, severity and suggested corrections |
+
+The document context template should use the following definitions:
+
+- **Document summary:** A comprehensive synthesis of the subject, analysis, arguments, findings and conclusions.
+- **Purpose:** The concrete undertaking, e.g. "Develop a new strategy for XYZ and identify priority initiatives," not generic labels such as "inform" or "seek approval."
+- **Audience:** Intended readers, inferred by the reasoner and validated by the customer.
+- **Domain:** Sector and subject matter, used to determine relevant knowledge.
+- **Structure:** Main sections and relationships across the document.
+- **Abbreviations and terms:** Identified by reasoning, interpreted using the source and available knowledge, and presented for customer validation or addition.
+- **Open questions:** Other material ambiguities requiring an open-ended customer answer, excluding abbreviation and term validation.
+
+**Arabic style should not appear in the context profile.** It is managed through the separate style-guide resource and translation/review prompts.
+
+### 3.4 Processing Configuration — Illustrative
+
+The application will also require a way to store which models are assigned to the different roles, which processing stages are enabled, and the permitted revision-cycle limits.
+
+This could be implemented through configuration files (e.g. `models.yaml` and `pipeline.yaml`) or application/database settings. **These filenames are examples only; Mpongo should determine the appropriate technical implementation.**
+
+The important requirement is that the configurable functions described below can be managed through Admin.
+
+---
+
+## 4. Admin Interface — Inspection and Control
+
+The Admin Interface should allow Sattam to **inspect completed translation requests, understand translation quality, and modify prompts, templates and approved knowledge** without routinely requiring Mpongo to make manual changes.
+
+### 4.1 Translation Requests
+
+A **translation request** is one customer-submitted document processed by the application.
+
+Admin should display a list of completed translation requests. Selecting a request opens its details.
+
+**A. Requests List**
+
+Display completed requests with access to their details. The main information needed is:
+
+- File name
+- Number of slides
+- Word count
+- Total processing duration
+
+**B. Selected Request — Whole-Document Information**
+
+This area describes the request as a whole, before examining individual translation segments.
+
+| Section | What Admin should show |
+|---|---|
+| **Document overview** | Original English file, final Arabic file, complete document-context profile generated before translation, customer validations, answers and unresolved questions |
+| **Processing information** | Sequence of stages executed, batch plan, models used, prompts/templates applied, relevant retrieved knowledge and processing duration by stage |
+| **Quality summary** | Number of findings by severity, total reviews/revisions performed, audit findings, resolved issues and outstanding issues |
+
+**C. Selected Request — Translation Content and Quality**
+
+This area is for inspecting the translated content itself, from the whole document down to individual text elements.
+
+| Capability | What Admin should allow |
+|---|---|
+| **Compare documents** | View the complete English and Arabic documents side by side |
+| **Examine specific text** | Select a slide, text box, paragraph or sentence to compare its English and Arabic |
+| **View translation history** | For a selected text ID, show the initial Arabic and every subsequent corrected version |
+| **View quality findings** | Show issues associated with selected text, including category, severity, explanation and suggested correction |
+| **Trace corrections** | See how many times that text was reviewed/revised, the reasoning model's decisions, changes made and verification outcomes |
+
+The selected text's unique ID connects all findings, correction decisions and translation versions. This relationship is essential to identifying recurring defects and studying how the correction process behaves.
+
+**D. Diagnostic Export**
+
+Admin should have the ability to **export the full translation request diagnostics as JSON**.
+
+The export should include document-level information and detailed records of the translation, review, correction and audit process. These records will be used for independent analysis in the ChatGPT Learning Workspace.
+
+### 4.2 Prompts, Templates and Knowledge Management
+
+To allow Sattam to improve translation behavior directly, Admin should provide the following:
+
+| Area | Required capabilities |
+|---|---|
+| **Model prompts** | View, edit and upload/replace the prompt used at each stage |
+| **Output templates** | View, edit and upload the structured templates used for model outputs, subject to application validation |
+| **General translation guidance** | View, edit, upload and remove guidance resources |
+| **Arabic style guide** | View, edit, upload and remove style resources |
+| **Approved glossary** | View, add, edit and remove terms; import/export CSV; manage applicability |
+| **Validated bilingual examples** | View, add, edit, upload and remove approved examples |
+| **Reference documents** | View, upload and remove documents; specify domain, client or project applicability |
+
+Changes should be reflected in subsequent translation requests without requiring code modifications.
+
+The application should retain which prompt/template and resource content was used in each request so earlier translations remain explainable after changes.
+
+### 4.3 Workflow Controls
+
+To allow Sattam to test the impact of different processing stages on translation quality, Admin should provide simple controls:
+
+| Setting | Capability |
+|---|---|
+| Customer clarification step | Enable / Disable |
+| Bilingual review | Enable / Disable |
+| Automatic correction | Enable / Disable |
+| Final document audit | Enable / Disable |
+| Maximum review correction cycles | Editable number |
+| Maximum audit correction cycles | Editable number |
+
+The application should execute the selected configuration and record which stages were enabled for each request.
+
+---
+
+## 5. Data Collection — Supporting Admin Inspection and Quality Analysis
+
+To support the Admin capabilities above, **multiple data points must be collected before, during and after translation**.
+
+These records are not additional customer-facing features. They are the information the application needs to retain so Sattam can investigate translation quality and processing behavior.
+
+The following identifies what should be collected and where it originates.
+
+| When | Data to capture | Produced by |
+|---|---|---|
+| **Before translation** | Original file, slide/word counts, extracted English text, unique IDs and original text locations | PPTX extraction |
+| | Document summary, purpose, audience, domain and structure | Reasoning model — document context |
+| | Identified terms, abbreviations, suggested definitions and Arabic equivalents | Reasoning model — document context |
+| | Customer validations, corrections, additions, answered and skipped questions | Customer confirmation step |
+| | Translation batches, included text IDs and context selected for each batch | Reasoning model — batch planning |
+| **During translation** | Initial Arabic for every text ID | Translation model |
+| | Findings, severity, explanations, affected IDs and review counts | Bilingual reviewer |
+| | Correction decisions and explanations | Reasoning model — correction decision |
+| | Every revised Arabic version, review results and resolution status | Targeted revision and verification |
+| | Processing duration, model, prompt/template and relevant knowledge used in each stage | Application |
+| **After translation** | Document-wide audit findings and affected text IDs | Document auditor |
+| | Audit correction decisions, revised translations and verification outcomes | Audit correction process |
+| | Final Arabic for every text ID and complete translation/review history | Application |
+| | Final Arabic PPTX and total processing duration | Application / PPTX reconstruction |
+
+All text-related records should remain connected through their IDs, allowing Admin to display the history for a specific sentence, paragraph or PowerPoint object.
+
+The complete records should also be available through the diagnostic JSON export, enabling comparisons between translation requests and identification of recurring errors.
+
+---
+
+## 6. Implementation Handoff
+
+**Action:** Rebuild the translation workflow according to the sequence in Section 2, implement the required prompts/resources and structured outputs in Section 3, and provide the Admin inspection, control and data capabilities in Sections 4–5.
+
+**Destination:** Existing translation website, application backend and Admin Interface.
+
+**Responsibilities:**
+
+- **Sattam — Business Analyst & Translation Quality Lead:** Defines translation behavior, linguistic requirements, knowledge resources, required diagnostics and quality acceptance.
+- **Mpongo — Programmer / Technical Lead:** Determines the implementation approach, integrates locally hosted models, implements processing stages and data handling, and develops the Admin capabilities.
+
+**Implementation assumptions:**
+
+- Existing PowerPoint extraction and Arabic reconstruction capabilities are available.
+- Models will be locally hosted and selected based on commercially permitted deployment and translation-quality evaluation.
+- Model roles can use the same or different installed models.
+- The existing ChatGPT/DeepL divergence comparison is not part of the new workflow.
+- Proposed filenames and output formats describe logical responsibilities; Mpongo can choose their physical implementation.
+
+**Expected result:** A document-aware translation system whose reasoning, translation, review, correction and audit stages work together, whose outputs are traceable at individual text-ID level, and whose prompts, templates, knowledge and relevant processing controls can be managed through Admin.
